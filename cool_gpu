@@ -1,0 +1,87 @@
+#!/bin/sh
+# cool_gpu       This script will enable or disable fixed gpu fan speed 
+#
+# chkconfig: 345 95 5
+# description:  A script hack for GPU fan control on headless GPU nodes
+#
+
+# Copyright (c)2011, Axel Kohlmeyer <akohlmey@gmail.com>
+
+# locations of all the magic
+dir=/opt/set-gpu-fans
+smi=/usr/bin/nvidia-smi
+set=/usr/bin/nvidia-settings
+
+# if we have a previous GPU logger, terminate it
+nvlpid=`pgrep -P 1 nvidia-smi`
+if [ "x${nvlpid}" != "x" ]
+then
+    kill -TERM ${nvlpid}
+fi
+
+# determine major driver version
+ver=`awk '/NVIDIA/ {print $8}' /proc/driver/nvidia/version | cut -d . -f 1`
+
+# drivers from 285.x.y on allow persistence mode setting
+# so we should not need the logger hack anymore
+if [ ${ver} -ge 285 ]
+then
+  ${smi} -pm 1
+else
+  # initialize GPU logger printing status once per hour 
+  # to keep an active handle on the GPUs and we don't 
+  # "lose" the settings applied in the following section.
+  nohup ${smi} -d -l -i 900 < /dev/null &> /dev/null &
+
+  # it always takes some time to get all the GPUs initialized,
+  # (about 5 seconds) so we give nvidia-smi a little while until 
+  # we launch any X servers to avoid unwanted race conditions.
+  sleep 10
+fi
+
+# for multiple tesla devices, only one display is supported.
+# thus we need to launch the X server once for each display
+# making each of the PCI IDs the primary device in turn.
+
+# command to set fan speed on primary GPU.
+nvscmd="${set} -a [gpu:0]/GPUFanControlState=1 -a [fan:0]/GPUTargetFanSpeed=85"
+
+# go back to automatic, if called with stop argument
+if [ "x$1" == "xstop" ]
+then
+  # with the newer driver, going back to default
+  # is simple. we just turn off persistence mode
+  # and trigger one reset by showing the GPU status
+  if [ ${ver} -ge 285 ]
+  then
+    ${smi} -pm 0
+    ${smi}
+    exit
+  else
+    nvscmd="${set} -a [gpu:0]/GPUFanControlState=0"
+  fi
+fi
+
+# get PCI bus ids of Nvidia cards and convert from hexadecimal to decimal. watch out for the falling toothpicks.
+pciid=`lspci  | sed -n -e '/VGA compatib.*NVIDIA/s/^\(..\):\(..\).\(.\).*/printf "PCI:%d:%d:%d\\\\\\\\n" 0x\1 0x\2 0x\3;/p'`
+
+for s in `eval ${pciid}`
+do \
+    cfg=`mktemp /tmp/xorg-XXXXXXXX.conf`
+    sed -e s,@GPU_BUS_ID@,${s},    \
+        -e s,@SET_GPU_DIR@,${dir}, \
+        ${dir}/xorg.conf >> ${cfg}
+    xinit ${nvscmd} --  :1 -once -config ${cfg}
+    rm -f ${cfg}
+done
+
+# no need to keep the logger around
+if [ "x$1" == "xstop" ]
+then
+    nvlpid=`pgrep -P 1 nvidia-smi`
+    if [ "x${nvlpid}" != "x" ]
+    then
+        kill -TERM ${nvlpid}
+    fi
+fi
+
